@@ -1,0 +1,25 @@
+# /etc/model-runner/config — the one place the two nodes' identity
+# is stated.
+#
+# Sourced and exported by the runner before anything else runs, so the fabric
+# probe, the recipe launcher, the stop and the status all address the same
+# worker. A recipe's own .env can name a different worker; these exports win.
+#
+# Two-Spark recipes need HEAD_IP, WORKER_IP and WORKER_SSH and are refused
+# without them. Single-Spark recipes never read them; with only single-Spark
+# recipes installed they can be left out.
+
+# Fabric addresses on the ConnectX link between the two Sparks. 10.0.0.1 and
+# 10.0.0.2 are the defaults every supported recipe ships with.
+HEAD_IP=10.0.0.1
+WORKER_IP=10.0.0.2
+
+# The account on the worker that holds the passwordless ssh trust from the head
+# and is in the worker's docker group. Set this to your worker user.
+WORKER_SSH=user@10.0.0.2
+
+# Seconds to wait at start for the fabric interface to carry its address.
+# netplan leaves it addressless for a few seconds after apply, and at boot the
+# unit can fire inside that window. Bounded so a dead fabric fails and the unit
+# retries later rather than hanging.
+FABRIC_WAIT_SEC=120

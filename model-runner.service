@@ -1,0 +1,50 @@
+[Unit]
+Description=model-runner: the selected model recipe on one or two DGX Sparks
+Documentation=file:///opt/model-runner/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+# A rate limit, not a total: refuses a start when more than 10 happen inside
+# 40 minutes. It bounds fast failure loops (fabric absent, worker down). It
+# does not bound slow ones; a launch that fails after an hour never trips it.
+# The total bound is the script's attempts counter (MAX_START_ATTEMPTS,
+# default 10 consecutive failures), which exits 75 to stop the retries.
+StartLimitIntervalSec=2400
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Replaced by install.sh with the installing account.
+User=operator
+WorkingDirectory=/opt/model-runner
+
+# State lives in /etc/model-runner, deliberately persistent across
+# reboot: the launched record is how a crash's containers get found and removed.
+
+ExecStart=/opt/model-runner/model-runner _exec-start
+ExecStop=/opt/model-runner/model-runner _exec-stop
+
+# systemd does not run ExecStop for a service whose start-up failed. The
+# upstream launchers leave both containers behind when readiness fails. This
+# runs on every exit path, including a failed or timed-out start, and targets
+# the identity in the launched record rather than the selector.
+ExecStopPost=/opt/model-runner/model-runner _cleanup
+
+# oneshot may use on-failure (only always/on-success are rejected for it).
+# Exit 75 = the script gave up after MAX_START_ATTEMPTS; do not restart.
+Restart=on-failure
+RestartSec=90
+RestartPreventExitStatus=75
+
+# A recipe launcher detaches its containers and returns once /health passes.
+# The launchers' own READY_TIMEOUT is 3600 s, and a launch that includes an
+# overlay rebuild and an image ship to the worker takes on the order of twenty
+# minutes. This bound sits above the launcher's own so that systemd never kills
+# a launch the recipe would have completed.
+TimeoutStartSec=4500
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
