@@ -8,6 +8,7 @@
 # Window: 262,144 (the recipe's, native).
 
 ADAPTER_TOPOLOGY=single
+ADAPTER_ID="qwen3.8-flash-next-nvfp4-solo"            # this adapter (state file names)
 ADAPTER_RECIPE="qwen3.8-flash-next-nvfp4-solo"
 ADAPTER_PORT=8888
 ADAPTER_MODEL_ID="Qwen3.8-Flash-Next"
@@ -15,6 +16,7 @@ ADAPTER_HEAD_CONTAINER="vllm_node"
 ADAPTER_CHECKPOINT="nvidia/Qwen3.8-Flash-Next-FP4-Local"
 ADAPTER_REVISION="b9ce18a6887e18c089fdea8509a33e63429a3300"
 ADAPTER_MAX_MODEL_LEN=262144
+ADAPTER_EXTRA_ARGS=()
 ADAPTER_ENV=(B12X_AUTOTUNE=0 B12X_COMPILE_WORKERS=1)
 # size<TAB>file at ADAPTER_REVISION (Hub API, 2026-10-18)
 ADAPTER_MANIFEST="$(cat <<'MANIFEST'
@@ -78,7 +80,28 @@ _eugr_err() { echo "adapter: $*" >&2; }
 
 _eugr_hf_hub() { printf '%s/.cache/huggingface/hub' "$HOME"; }
 
-_eugr_config_file() { printf '%s/eugr-%s.env' "${STATE:?model-runner STATE is not set}" "$ADAPTER_RECIPE"; }
+_eugr_config_file() { printf '%s/eugr-%s.env' "${STATE:?model-runner STATE is not set}" "$ADAPTER_ID"; }
+
+# The recipe the launcher runs: the checkout's own when its `model:` is ADAPTER_CHECKPOINT, otherwise a derived copy in
+# the runner's state directory with exactly the `model:` line and the `vllm serve <model>` line changed (a checkpoint
+# in the same format as the recipe's, e.g. an abliterated derivative). Prints the name or the path for run-recipe.sh.
+_eugr_recipe_ref() {
+    local src="$RECIPE_DIR/recipes/$ADAPTER_RECIPE.yaml" orig dst n
+    [ "$(grep -c '^model:' "$src")" -eq 1 ] || { _eugr_err "$src has $(grep -c '^model:' "$src") model: lines, expected 1"; return 1; }
+    orig="$(sed -n 's/^model:[[:space:]]*//p' "$src")"
+    if [ "$orig" = "$ADAPTER_CHECKPOINT" ]; then printf '%s\n' "$ADAPTER_RECIPE"; return 0; fi
+    # the two source lines the copy changes, each present exactly once, before anything is written
+    [ "$(grep -cxF "model: $orig" "$src")" -eq 1 ] && [ "$(grep -cF "vllm serve $orig " "$src")" -eq 1 ] \
+        || { _eugr_err "$src does not have exactly one 'model: $orig' line and one 'vllm serve $orig ' line"; return 1; }
+    dst="${STATE:?model-runner STATE is not set}/eugr-$ADAPTER_ID.yaml"
+    awk -v o="$orig" -v n="$ADAPTER_CHECKPOINT" '
+        $0 == "model: " o { print "model: " n; next }
+        index($0, "vllm serve " o " ") { sub("vllm serve " o " ", "vllm serve " n " "); print; next }
+        { print }' "$src" > "$dst.tmp.$$" || { rm -f "$dst.tmp.$$"; return 1; }
+    n="$(diff "$src" "$dst.tmp.$$" | grep -c '^>')"
+    [ "$n" -eq 2 ] || { rm -f "$dst.tmp.$$"; _eugr_err "derived recipe changes $n lines of $src, expected exactly the model: and vllm serve lines"; return 1; }
+    mv -f "$dst.tmp.$$" "$dst"; printf '%s\n' "$dst"
+}
 
 # The launcher's config for this launch: node and fabric identity only. Written atomically.
 _eugr_write_config() {
@@ -96,7 +119,8 @@ _eugr_write_config() {
 # The launch command, arguments only (the caller adds --dry-run or nothing).
 _eugr_args() {
     local e
-    EUGR_ARGS=("$ADAPTER_RECIPE" --config "$(_eugr_config_file)" --name "$ADAPTER_HEAD_CONTAINER"
+    local ref; ref="$(_eugr_recipe_ref)" || return 1
+    EUGR_ARGS=("$ref" --config "$(_eugr_config_file)" --name "$ADAPTER_HEAD_CONTAINER"
                --port "$ADAPTER_PORT" --max-model-len "$ADAPTER_MAX_MODEL_LEN" -d)
     if [ "$ADAPTER_TOPOLOGY" = pair ]; then
         EUGR_ARGS+=(--nodes "$HEAD_IP,$WORKER_IP" --eth-if "$HEAD_IF" --ib-if "$HEAD_IB")
@@ -105,11 +129,11 @@ _eugr_args() {
     fi
     EUGR_ARGS+=(--env HF_HUB_OFFLINE=1)
     for e in "${ADAPTER_ENV[@]}"; do EUGR_ARGS+=(--env "$e"); done
-    EUGR_ARGS+=(-- --served-model-name "$ADAPTER_MODEL_ID" --revision "$ADAPTER_REVISION")
+    EUGR_ARGS+=(-- --served-model-name "$ADAPTER_MODEL_ID" --revision "$ADAPTER_REVISION" "${ADAPTER_EXTRA_ARGS[@]}")
 }
 
 _eugr_run() { # run-recipe.sh under an empty environment; extra args first
-    _eugr_args
+    _eugr_args || return 1
     ( cd "$RECIPE_DIR" && env -i PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
         ./run-recipe.sh "${EUGR_ARGS[@]:0:1}" "$@" "${EUGR_ARGS[@]:1}" )
 }
@@ -201,8 +225,8 @@ adapter_prepare() {
     _eugr_write_config || return 1
     out="$(_eugr_run --dry-run 2>&1)" || { printf '%s\n' "$out" | tail -20 >&2; _eugr_err "the launcher's dry run failed"; return 1; }
     local want
-    for want in "--port $ADAPTER_PORT" "--max-model-len $ADAPTER_MAX_MODEL_LEN" \
-                "--served-model-name $ADAPTER_MODEL_ID" "--revision $ADAPTER_REVISION"; do
+    for want in "vllm serve $ADAPTER_CHECKPOINT " "--port $ADAPTER_PORT" "--max-model-len $ADAPTER_MAX_MODEL_LEN" \
+                "--served-model-name $ADAPTER_MODEL_ID" "--revision $ADAPTER_REVISION" "${ADAPTER_EXTRA_ARGS[*]}"; do
         grep -qF -- "$want" <<<"$out" || { printf '%s\n' "$out" | tail -20 >&2; _eugr_err "the dry-run command lacks '$want'"; return 1; }
     done
 }
@@ -222,7 +246,7 @@ adapter_start() {
     local deadline t0
     _eugr_check_image || return 1
     _eugr_write_config || return 1
-    echo "adapter: $ADAPTER_RECIPE: $ADAPTER_CHECKPOINT@$ADAPTER_REVISION, image $EUGR_IMAGE $EUGR_IMAGE_ID" >&2
+    echo "adapter: $ADAPTER_ID ($ADAPTER_RECIPE): $ADAPTER_CHECKPOINT@$ADAPTER_REVISION, image $EUGR_IMAGE $EUGR_IMAGE_ID, repo digests $(docker image inspect -f '{{join .RepoDigests ","}}' "$EUGR_IMAGE" 2>/dev/null || echo none)" >&2
     _eugr_run || { _eugr_err "the launcher returned non-zero"; return 1; }
     t0="$(date +%s)"; deadline=$(( t0 + EUGR_WAIT_TIMEOUT ))
     while [ "$(date +%s)" -lt "$deadline" ]; do

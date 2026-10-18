@@ -253,7 +253,7 @@ serve that dies about 60 s in before suspecting anything else.
 ## Adapters
 
 Each adapter is written from its launcher's source, because the launchers differ in how
-they take configuration. Sixteen adapters, in three groups.
+they take configuration. Seventeen adapters, in three groups.
 
 The four vLLM / EXL3 two-Spark recipes:
 
@@ -297,17 +297,19 @@ Added 2026-10-18 to the first two groups (same shapes as the tables above):
 | containers | `vllm-fn-tp1` | `dsv41-flash-exl3` on both nodes | `mimo26-tp2-head` / `-worker` | `qwen38-fn-tf` on both nodes |
 | image build and downloads | by hand per the recipe's README | by hand (`docker/Dockerfile` as `canonical-e14`, the pinned pack on both nodes) | by hand (`./start.sh build`, the checkpoint) | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand |
 
-The eugr/spark-vllm-docker recipes (vLLM b12x, NVIDIA FP4-Local checkpoints): one checkout shared by three adapters,
-`recipes/<model>/<recipe>` symlinks to it, each adapter naming its recipe explicitly.
+The eugr/spark-vllm-docker recipes (vLLM b12x, NVIDIA FP4-Local checkpoints): one checkout shared by four adapters,
+`recipes/<model>/<recipe>` symlinks to it, each adapter naming its recipe explicitly. An adapter whose checkpoint is
+not the recipe's `model:` (the abliterated GLM build) runs a derived copy of the recipe written to the runner's state
+directory, with exactly the `model:` line and the `vllm serve` model changed.
 
-| | Qwen3.8-Flash-Next FP4-Local, one Spark | Qwen3.8-Flash-Next FP4-Local, two Sparks | GLM-5.3-Flash FP4-Local |
-|---|---|---|---|
-| recipe | `qwen3.8-flash-next-nvfp4-solo` | `qwen3.8-flash-next-nvfp4-cluster` | `glm-5.3-flash` |
-| topology | one Spark | two Sparks | two Sparks |
-| configuration | every launcher call runs under `env -i` with `--config` naming a file the adapter writes in the runner's state directory (node and fabric identity only; empty for one Spark); the checkout's `.env` and inherited `DOTENV_*` are never read | same | same |
-| checked before the stop of the current serve | the checkout at the reviewed commit with no tracked change, PyYAML present, the checkpoint at its pinned revision against the file manifest in the adapter (names, sizes, config and index) in `$HOME/.cache/huggingface` on each node, the image `vllm-node-b12x` on each node (equal Id or equal content), the launcher's dry run | same | same |
-| containers | `vllm_node` | `vllm_node` on both nodes | `vllm_node` on both nodes |
-| stop | `docker stop -t 90` and remove, by recorded name on the recorded hosts; the launcher is not called | same | same |
+| | Qwen3.8-Flash-Next FP4-Local, one Spark | Qwen3.8-Flash-Next FP4-Local, two Sparks | GLM-5.3-Flash FP4-Local | GLM-5.3-Flash FP4-Local abliterated (Huihui) |
+|---|---|---|---|---|
+| recipe | `qwen3.8-flash-next-nvfp4-solo` | `qwen3.8-flash-next-nvfp4-cluster` | `glm-5.3-flash` | `glm-5.3-flash`, derived copy |
+| topology | one Spark | two Sparks | two Sparks | two Sparks |
+| configuration | every launcher call runs under `env -i` with `--config` naming a file the adapter writes in the runner's state directory (node and fabric identity only; empty for one Spark); the checkout's `.env` and inherited `DOTENV_*` are never read | same | same | same |
+| checked before the stop of the current serve | the checkout at the reviewed commit with no tracked change, PyYAML present, the checkpoint at its pinned revision against the file manifest in the adapter (names, sizes, config and index) in `$HOME/.cache/huggingface` on each node, the image `vllm-node-b12x` on each node (equal Id or equal content), the launcher's dry run | same | same | same |
+| containers | `vllm_node` | `vllm_node` on both nodes | `vllm_node` on both nodes | `vllm_node` on both nodes |
+| stop | `docker stop -t 90` and remove, by recorded name on the recorded hosts; the launcher is not called | same | same | same |
 
 ### Verified against
 
@@ -341,6 +343,7 @@ adapter say what to look for.
 | Qwen3.8-Flash-Next FP4-Local, one Spark | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
 | Qwen3.8-Flash-Next FP4-Local, two Sparks | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
 | GLM-5.3-Flash FP4-Local | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
+| GLM-5.3-Flash FP4-Local abliterated (Huihui) | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
 
 ### Per-recipe prerequisites
 
@@ -394,7 +397,7 @@ One-time, in the recipe's own config file, beyond what its README already asks f
   image (`./start.sh build`) and the checkpoint.
 - **eugr/spark-vllm-docker recipes**: clone it once to `recipes/spark-vllm-docker` at the reviewed commit and link
   `recipes/Qwen3.8-Flash-Next/qwen3.8-flash-next-nvfp4-solo`, `.../qwen3.8-flash-next-nvfp4-cluster` and
-  `recipes/GLM-5.3-Flash/glm-5.3-flash` to it; PyYAML on the head; `./build-and-copy.sh --exp-b12x` on the head (and
+  `recipes/GLM-5.3-Flash/glm-5.3-flash` and `recipes/GLM-5.3-Flash/glm-5.3-flash-huihui-abliterated` to it; PyYAML on the head; `./build-and-copy.sh --exp-b12x` on the head (and
   `--no-build -c <worker>` for the two-Spark recipes); `hf download <checkpoint> --revision <the adapter's revision>`
   on every node the recipe uses. The worker is reached as this account at `WORKER_IP`.
 
