@@ -253,7 +253,7 @@ serve that dies about 60 s in before suspecting anything else.
 ## Adapters
 
 Each adapter is written from its launcher's source, because the launchers differ in how
-they take configuration. Nine adapters, in two groups.
+they take configuration. Sixteen adapters, in three groups.
 
 The four vLLM / EXL3 two-Spark recipes:
 
@@ -287,6 +287,28 @@ from its file alone:
 | image build and downloads | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand | by hand, per the recipe's README | by hand, per `docs/INSTALL.md` | by hand, `docs/ZIG-SERVE.md` steps 1 and 2 | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand |
 | stop | rank logs saved as the recipe's `stop.sh` saves them, 30 s graceful stop, removed | removed on the recorded nodes | removed on the recorded nodes | SIGTERM to rank 0 (drain), rank 1 waited for, logs saved, removed | the recipe's `stop.sh` (30 s graceful stop, removed) |
 
+Added 2026-10-18 to the first two groups (same shapes as the tables above):
+
+| | Qwen3.8-Flash-Next Single NVFP4 | DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz) | MiMo-V2.6-Flash | Qwen3.8-Flash TensorFold, two Sparks |
+|---|---|---|---|---|
+| topology | one Spark | two Sparks | two Sparks | two Sparks |
+| config file | `.env` | none | `.env` (`ENV_FILE`) | `.env`, `scripts/local.sh` |
+| environment vs file | caller exports win only for the keys start.sh captures (`PORT`); `.env` wins for the rest, so `TP1_CONTAINER_NAME` is verified and then passed explicitly at start and stop | caller exports win for every key; `MODEL`, `HF_CACHE`, `SNAPSHOT_SHA` and `IMAGE` are exported and the launcher's early-exit controls cleared | file wins; the adapter pins `ENV_FILE` to the recipe's `.env`, computes the effective values and refuses a `.env` that redirects identity, NFS or `ENV_FILE` | environment first, so the node identity is exported (`WORKER`, `FABRIC_PEER`) |
+| containers | `vllm-fn-tp1` | `dsv41-flash-exl3` on both nodes | `mimo26-tp2-head` / `-worker` | `qwen38-fn-tf` on both nodes |
+| image build and downloads | by hand per the recipe's README | by hand (`docker/Dockerfile` as `canonical-e14`, the pinned pack on both nodes) | by hand (`./start.sh build`, the checkpoint) | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand |
+
+The eugr/spark-vllm-docker recipes (vLLM b12x, NVIDIA FP4-Local checkpoints): one checkout shared by three adapters,
+`recipes/<model>/<recipe>` symlinks to it, each adapter naming its recipe explicitly.
+
+| | Qwen3.8-Flash-Next FP4-Local, one Spark | Qwen3.8-Flash-Next FP4-Local, two Sparks | GLM-5.3-Flash FP4-Local |
+|---|---|---|---|
+| recipe | `qwen3.8-flash-next-nvfp4-solo` | `qwen3.8-flash-next-nvfp4-cluster` | `glm-5.3-flash` |
+| topology | one Spark | two Sparks | two Sparks |
+| configuration | every launcher call runs under `env -i` with `--config` naming a file the adapter writes in the runner's state directory (node and fabric identity only; empty for one Spark); the checkout's `.env` and inherited `DOTENV_*` are never read | same | same |
+| checked before the stop of the current serve | the checkout at the reviewed commit with no tracked change, PyYAML present, the checkpoint at its pinned revision against the file manifest in the adapter (names, sizes, config and index) in `$HOME/.cache/huggingface` on each node, the image `vllm-node-b12x` on each node (equal Id or equal content), the launcher's dry run | same | same |
+| containers | `vllm_node` | `vllm_node` on both nodes | `vllm_node` on both nodes |
+| stop | `docker stop -t 90` and remove, by recorded name on the recorded hosts; the launcher is not called | same | same |
+
 ### Verified against
 
 An adapter is verified against the upstream commits below. "Launched" is a serve brought
@@ -311,7 +333,14 @@ adapter say what to look for.
 | GLM-5.3-Flash TensorFold (jayleaton) | jayleaton/glm53-tensorfold-spark | b463237 | f79bf9c |
 | DeepSeek-V4.1-Flash TensorFold | jayleaton/deepseek-v41-tensorfold-spark | not recorded | 2dcce03 |
 | DeepSeek-V4.1-Flash TensorFold Zig | jayleaton/deepseek-v41-tensorfold-spark | c34da993 | 2dcce03 |
-| Qwen3.8-Flash-Next TensorFold, one Spark | MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold | not launched | 4e1239d |
+| Qwen3.8-Flash-Next TensorFold, one Spark | MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold | not launched | 656879f |
+| Qwen3.8-Flash-Next Single NVFP4 | MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark | not launched | b7c5da1 |
+| Qwen3.8-Flash TensorFold, two Sparks | MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold | not launched | 6730319 |
+| DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz) | sfxnz/DeepSeek-V4.1-Flash-EXL3-vLLM-2x-DGX-Spark | not launched | 3de9146 |
+| MiMo-V2.6-Flash | MiaAI-Lab/MiMo-V2.6-Flash-2x-DGX-Sparks | not launched | 201be3e |
+| Qwen3.8-Flash-Next FP4-Local, one Spark | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
+| Qwen3.8-Flash-Next FP4-Local, two Sparks | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
+| GLM-5.3-Flash FP4-Local | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
 
 ### Per-recipe prerequisites
 
@@ -355,6 +384,19 @@ One-time, in the recipe's own config file, beyond what its README already asks f
   starts both ranks from the head, so the worker needs no checkout.
 - **Qwen3.8-Flash-Next TensorFold, one Spark**: run `scripts/prepare.sh` once. Nothing in
   the runner's config is needed for it.
+- **Qwen3.8-Flash-Next Single NVFP4**: `cp .env.sample .env`, set `IMAGE`, and set `TP1_MODEL_ID` to a checkpoint in the
+  local cache (`nvidia/Qwen3.8-Flash-Next-NVFP4`). The recipe's own supervisor and heartbeat units stay unused.
+- **Qwen3.8-Flash TensorFold, two Sparks**: `scripts/local.sh` with `WORKER` set to the value of `WORKER_SSH`, then
+  `scripts/prepare.sh` once (image on both nodes, checkpoint copied to the worker).
+- **DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz)**: the image `dsv41-flash-exl3-sm121:canonical-e14` and the pack revision
+  `2.0bpw-mcg-viterbi-lmhead-mxfp8` of `sfxnz/DeepSeek-V4.1-Flash-EXL3` in `$HOME/.cache/huggingface` on both nodes.
+- **MiMo-V2.6-Flash**: `cp .env.example .env`, then the identity, NFS and worker-path keys the adapter names; the
+  image (`./start.sh build`) and the checkpoint.
+- **eugr/spark-vllm-docker recipes**: clone it once to `recipes/spark-vllm-docker` at the reviewed commit and link
+  `recipes/Qwen3.8-Flash-Next/qwen3.8-flash-next-nvfp4-solo`, `.../qwen3.8-flash-next-nvfp4-cluster` and
+  `recipes/GLM-5.3-Flash/glm-5.3-flash` to it; PyYAML on the head; `./build-and-copy.sh --exp-b12x` on the head (and
+  `--no-build -c <worker>` for the two-Spark recipes); `hf download <checkpoint> --revision <the adapter's revision>`
+  on every node the recipe uses. The worker is reached as this account at `WORKER_IP`.
 
 ### Writing an adapter
 
