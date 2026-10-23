@@ -387,6 +387,66 @@ cmd_status() {
     fi
 }
 
+# One watchdog tick (model-runner-watchdog.timer, every minute; the recipe's own watchdog, as the
+# DeepSeek TensorFold recipe's `serve.sh watch --once`, re-pointed at this unit). A tick is bad when
+# the launched recipe's /health fails: a rank gone, or the serve's own stall report (the TensorFold
+# serves answer 503 "stalled" once work is in flight and no round ended for TF_DSV41_STALL_ROUND_S,
+# 120 s). WATCH_FAILS bad ticks in a row request a restart of the unit, at most once every
+# WATCH_MIN_HEAL s.
+#
+# The operator's lifecycle always wins:
+# - The tick holds the switch lock and the lifecycle lock (both non-blocking, so it never waits on a
+#   `use`, start, stop or cleanup; it stands down) from its first check to its restart request.
+# - It stands down unless the unit is active: activating is a launch in progress, deactivating or
+#   inactive a stop. The unit turns active only after the launcher saw /health pass, so a load is
+#   never counted.
+# - The request is `restart --job-mode=fail`. systemd refuses it while any stop job is queued or
+#   running on the unit: STOP x RESTART does not merge, so the transaction is "destructive"
+#   (src/core/job.h job_type_is_conflicting, transaction.c transaction_is_destructive). A stop issued
+#   after the request replaces the queued restart (the default job mode).
+# A refused request keeps the bad-tick count and records no restart, so the next tick asks again.
+WATCH_FAILS="${WATCH_FAILS:-3}"
+WATCH_MIN_HEAL="${WATCH_MIN_HEAL:-1800}"
+WATCH_FAILS_FILE="$STATE/watch.fails"
+WATCH_HEAL_FILE="$STATE/watch.last_heal"
+
+unit_active() { [ "$(systemctl is-active "$UNIT" 2>/dev/null || true)" = active ]; }
+
+cmd_watch() {
+    local rec fails last now rc
+    # Read-only opens: the tick runs as root and must never create a lock file, which would leave it
+    # root-owned and refuse the runner account's own `>` opens. install.sh provisions both locks as
+    # that account; flock needs no write access.
+    { exec 8<"$SWITCH_LOCK"; } 2>/dev/null    || { log "watch: $SWITCH_LOCK missing (run install.sh); standing down"; return 0; }
+    flock -n 8 || { log "watch: a switch is in progress; standing down"; return 0; }
+    { exec 9<"$LIFECYCLE_LOCK"; } 2>/dev/null || { log "watch: $LIFECYCLE_LOCK missing (run install.sh); standing down"; return 0; }
+    flock -n 9 || { log "watch: lifecycle lock held; standing down"; return 0; }
+    unit_active || { rm -f "$WATCH_FAILS_FILE"; return 0; }
+    load_launched || { rm -f "$WATCH_FAILS_FILE"; return 0; }
+    rec="$(launched)"
+    if adapter_health 2>/dev/null; then rm -f "$WATCH_FAILS_FILE"; return 0; fi
+    # a stop or a switch that began during the probe: not a failure of the serve
+    if ! unit_active || [ "$(launched 2>/dev/null || true)" != "$rec" ]; then
+        log "watch: $UNIT changed state during the probe; standing down"; rm -f "$WATCH_FAILS_FILE"; return 0
+    fi
+    fails=$(( $(cat "$WATCH_FAILS_FILE" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$fails" > "$WATCH_FAILS_FILE"
+    log "watch: $rec /health failed, bad tick $fails of $WATCH_FAILS"
+    [ "$fails" -ge "$WATCH_FAILS" ] || return 0
+    now=$(date +%s); last=$(cat "$WATCH_HEAL_FILE" 2>/dev/null || echo 0)
+    if [ $(( now - last )) -lt "$WATCH_MIN_HEAL" ]; then
+        log "watch: unhealthy; a restart was requested $(( now - last )) s ago, the next is allowed after ${WATCH_MIN_HEAL} s"
+        return 1
+    fi
+    systemctl restart --no-block --job-mode=fail "$UNIT" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "watch: unhealthy for $fails ticks; restart request refused (rc $rc); nothing recorded, asked again next tick"
+        return 1
+    fi
+    printf '%s\n' "$now" > "$WATCH_HEAL_FILE"; rm -f "$WATCH_FAILS_FILE"
+    log "watch: unhealthy for $fails ticks; restart of $UNIT requested (job queued)"
+}
+
 cmd_list() {
     local root="$BASE/adapters" f n=0
     while IFS= read -r f; do
@@ -407,5 +467,6 @@ case "${1:-}" in
     _exec-start) cmd_exec_start ;;
     _exec-stop)  cmd_exec_stop ;;
     _cleanup)    cmd_cleanup ;;
+    _watch)      cmd_watch ;;
     *)           sed -n '2,13p' "$0"; exit 2 ;;
 esac

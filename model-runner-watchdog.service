@@ -1,0 +1,15 @@
+# One watchdog tick for the selected recipe (model-runner _watch), run by model-runner-watchdog.timer.
+# As root: the tick restarts model-runner.service itself, and the operator account's systemctl calls
+# go through sudo. Pause it while you benchmark or maintain the serve:
+#   sudo systemctl stop model-runner-watchdog.timer
+[Unit]
+Description=model-runner watchdog tick
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/model-runner
+ExecStart=/opt/model-runner/model-runner _watch
+# an unhealthy tick is logged, not a unit failure that trips start limits
+SuccessExitStatus=1
+TimeoutStartSec=60

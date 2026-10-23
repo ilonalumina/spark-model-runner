@@ -7,9 +7,9 @@
 #     git pull && ./install.sh
 # Idempotent. Re-copies the tool, adapters, README, LICENSE and the unit every
 # time.
-# Never touches runtime state: {active,launched,attempts} and the locks under
-# /etc/model-runner are left alone, and config is only seeded when
-# absent.
+# Never touches runtime state: {active,launched,attempts} under /etc/model-runner
+# are left alone, the two lock files are only created when absent (an existing
+# one keeps its inode), and config is only seeded when absent.
 #
 # Recipes are not installed by this script. They are upstream checkouts under
 # /opt/model-runner/recipes/<model>/<recipe>, cloned by the
@@ -76,6 +76,11 @@ if [ ! -f "$STATE/config" ]; then
     echo "install: seeded $STATE/config from config.example — review it (two-Spark recipes need WORKER_SSH)"
 fi
 
+# The two lock files exist before the watchdog timer is enabled: its root tick only opens them
+# read-only, so it never creates one root-owned. touch keeps an existing lock's inode (a lock held
+# right now stays the same lock); the chown below gives both to the runner account.
+sudo touch "$STATE/switch.lock" "$STATE/lifecycle.lock"
+
 # The launcher runs as the operator (docker group, node-to-node ssh key) and
 # writes into its recipe tree; the tool writes its state files.
 sudo chown -R "$OWNER" "$DEST" "$STATE"
@@ -99,6 +104,13 @@ sudo systemctl daemon-reload
 # Enabled, so the selected recipe comes back after a reboot; enable never starts
 # anything by itself, so a running serve is untouched here as well.
 sudo systemctl enable --quiet "$UNIT"
+
+# The watchdog tick runs as root (it restarts the unit itself); its timer is enabled and started,
+# which only begins the ticks: a tick restarts nothing unless the active serve fails /health.
+sudo install -m 0644 "$SRC/$NAME-watchdog.service" "/etc/systemd/system/$NAME-watchdog.service"
+sudo install -m 0644 "$SRC/$NAME-watchdog.timer"   "/etc/systemd/system/$NAME-watchdog.timer"
+sudo systemctl daemon-reload
+sudo systemctl enable --now --quiet "$NAME-watchdog.timer"
 
 # On PATH, pointing at the install, never at the checkout.
 sudo ln -sfn "$DEST/$NAME" "/usr/local/bin/$NAME"

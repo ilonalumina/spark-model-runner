@@ -379,7 +379,8 @@ One-time, in the recipe's own config file, beyond what its README already asks f
   `cp config/prod.env.example config/prod.env`, then `WORKER_SSH`, `HEAD_IP`, the node
   paths and the CX7 names; the adapter refuses while a `<placeholder>` is left or a value
   differs from the derived facts. The DeepSeek recipe's own watchdog and boot units
-  (`scripts/systemd`) stay unused: the runner owns start, stop and boot.
+  (`scripts/systemd`) stay unused: the runner owns start, stop and boot, and its own
+  watchdog timer does the recipe watchdog's job for every recipe.
 - **DeepSeek-V4.1-Flash TensorFold Zig**: `cp config/prod-zig.env.example
   config/prod-zig.env` and fill it in, build the image with `ZIG_COMMIT` set to the
   checkout's commit, and put the image, the model, the Engram shards, the assets and the
@@ -436,10 +437,13 @@ warning until that serve is verified down.
 
 ## What it does not do
 
-- **No health watchdog.** If a rank dies mid-serve the unit stays active
-  (`RemainAfterExit`) while `/health` is down. `status` shows it; nothing restarts it. A
-  systemd timer probing `/health` and restarting the unit on failure would be the next
-  piece. The boot retries above cover failures before the serve is up.
+- **Restarts, never fails over.** `model-runner-watchdog.timer` runs `model-runner _watch`
+  every minute: three failed `/health` probes of the active recipe in a row (a rank gone, or
+  a TensorFold serve's own 503 `stalled`) request a restart of the unit, at most once every
+  30 minutes (`WATCH_FAILS`, `WATCH_MIN_HEAL`). It stands down during a `use`, launch, stop or
+  cleanup and while the unit is not active, and its request (`--job-mode=fail`) is refused by
+  systemd while a stop is queued, so a deliberate stop always wins. Pause it for benchmarks:
+  `sudo systemctl stop model-runner-watchdog.timer`.
 - **No stable port across recipes.** A consumer needs the endpoint and the model id for
   whichever recipe is active; `status` prints both.
 - **Starts nothing on the worker itself.** The recipe launchers start rank 1 over ssh;
