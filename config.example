@@ -1,0 +1,12 @@
+# /etc/model-runner/config. Exported before every launch, stop and status.
+# Single-Spark recipes do not read HEAD_IP, WORKER_IP or WORKER_SSH.
+
+# Addresses on the ConnectX link between the two Sparks.
+HEAD_IP=10.0.0.1
+WORKER_IP=10.0.0.2
+
+# Worker account with passwordless ssh from the head and membership in the worker's docker group.
+WORKER_SSH=user@10.0.0.2
+
+# Seconds to wait at start for the fabric interface to get its address.
+FABRIC_WAIT_SEC=120

@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# model-runner — one active model recipe on one DGX Spark or on two (a head
+# and a worker), selected by name.
+#
+#   model-runner use <model>/<recipe>
+#                          select a recipe; stop the old one, verify it is
+#                          gone on every node, then start the new one
+#   model-runner start     start the selected recipe (via systemd)
+#   model-runner stop      stop the running recipe (via systemd)
+#   model-runner restart   restart the selected recipe; start/restart/use refuse
+#                          during a launch unless given --force
+#   model-runner status    selected, launched identity, health, unit state
+#   model-runner list      adapters available
+
+# Containers are started and removed only by the systemd unit (_exec-start, _exec-stop, _cleanup).
+# State in $STATE: active (selected recipe), launched (what was actually started; stop acts on this),
+# attempts (consecutive failed starts).
+
+set -euo pipefail
+
+NAME=model-runner
+BASE="${MODEL_RUNNER_BASE:-/opt/$NAME}"
+STATE="${MODEL_RUNNER_STATE:-/etc/$NAME}"
+CONFIG="$STATE/config"
+SELECTOR="$STATE/active"
+LAUNCHED="$STATE/launched"
+ATTEMPTS="$STATE/attempts"
+SWITCH_LOCK="$STATE/switch.lock"
+LIFECYCLE_LOCK="$STATE/lifecycle.lock"
+UNIT="$NAME.service"
+
+VERIFY_SSH_SEC="${VERIFY_SSH_SEC:-20}"
+VERIFY_DOCKER_SEC="${VERIFY_DOCKER_SEC:-20}"
+
+# Exit 75 is RestartPreventExitStatus in the unit.
+MAX_START_ATTEMPTS="${MAX_START_ATTEMPTS:-10}"
+EXIT_GIVE_UP=75
+
+log() { printf '[%s] %s\n' "$NAME" "$*"; }
+die() { printf '[%s] %s\n' "$NAME" "$*" >&2; exit 1; }
+
+[ -f "$CONFIG" ] || die "missing $CONFIG — copy config.example there first"
+# shellcheck disable=SC1090
+set -a; . "$CONFIG"; set +a
+FABRIC_WAIT_SEC="${FABRIC_WAIT_SEC:-120}"
+
+# shellcheck source=fabric-facts.sh
+. "$BASE/fabric-facts.sh"
+
+selected() {
+    [ -s "$SELECTOR" ] || return 1
+    tr -d '[:space:]' < "$SELECTOR"
+}
+
+launched() {
+    [ -s "$LAUNCHED" ] || return 1
+    sed -n 's/^RECIPE=//p' "$LAUNCHED"
+}
+
+# <model>/<recipe> names both adapters/<model>/<recipe>.sh and recipes/<model>/<recipe>/.
+adapter_file() {
+    local name="$1"
+    case "$name" in
+        ""|/*|*/|..|../*|*/..|*/../*) return 1 ;;
+    esac
+    printf '%s/adapters/%s.sh' "$BASE" "$name"
+}
+
+load_adapter() {
+    local name="$1" f
+    f="$(adapter_file "$name")" || die "invalid recipe name '$name' — form is <model>/<recipe>, see: $NAME list"
+    [ -f "$f" ] || die "no adapter for '$name'; see: $NAME list"
+    RECIPE_DIR="$BASE/recipes/$name"
+    unset ADAPTER_TOPOLOGY ADAPTER_WORKER_CONTAINER
+    # shellcheck disable=SC1090
+    . "$f"
+    ADAPTER_TOPOLOGY="${ADAPTER_TOPOLOGY:-pair}"
+    case "$ADAPTER_TOPOLOGY" in
+        single|pair) ;;
+        *) die "adapter $name: ADAPTER_TOPOLOGY is '$ADAPTER_TOPOLOGY'; it is single or pair" ;;
+    esac
+}
+
+pair() { [ "$ADAPTER_TOPOLOGY" = pair ]; }
+
+require_worker_config() {
+    local k missing=()
+    pair || return 0
+    for k in HEAD_IP WORKER_IP WORKER_SSH; do
+        [ -n "${!k:-}" ] || missing+=("$k")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+    log "$1 runs on two nodes; set ${missing[*]} in $CONFIG"
+    return 1
+}
+
+# Loads the launched recipe's adapter with the identity recorded at launch, so later config edits cannot redirect a stop.
+load_launched() {
+    local rec k v
+    rec="$(launched)" || return 1
+    load_adapter "$rec"
+    ADAPTER_TOPOLOGY=pair
+    while IFS='=' read -r k v; do
+        case "$k" in
+            TOPOLOGY)         ADAPTER_TOPOLOGY="$v" ;;
+            RECIPE_DIR)       RECIPE_DIR="$v" ;;
+            WORKER_SSH)       WORKER_SSH="$v"; export WORKER_SSH ;;
+            HEAD_CONTAINER)   ADAPTER_HEAD_CONTAINER="$v" ;;
+            WORKER_CONTAINER) ADAPTER_WORKER_CONTAINER="$v" ;;
+            PORT)             ADAPTER_PORT="$v" ;;
+        esac
+    done < "$LAUNCHED"
+    case "$ADAPTER_TOPOLOGY" in
+        single|pair) ;;
+        *) die "$LAUNCHED: TOPOLOGY is '$ADAPTER_TOPOLOGY'; it is single or pair" ;;
+    esac
+}
+
+write_launched() {
+    local tmp="$LAUNCHED.tmp.$$" wssh="" wc=""
+    if pair; then wssh="$WORKER_SSH" wc="$ADAPTER_WORKER_CONTAINER"; fi
+    printf 'RECIPE=%s\nTOPOLOGY=%s\nRECIPE_DIR=%s\nWORKER_SSH=%s\nHEAD_CONTAINER=%s\nWORKER_CONTAINER=%s\nPORT=%s\n' \
+        "$1" "$ADAPTER_TOPOLOGY" "$RECIPE_DIR" "$wssh" \
+        "$ADAPTER_HEAD_CONTAINER" "$wc" "$ADAPTER_PORT" > "$tmp"
+    mv -f "$tmp" "$LAUNCHED"
+}
+
+# Returns 0 if the recipe's containers are absent on every node, 1 if present anywhere, 2 if a node cannot be queried.
+verify_absent() {
+    local out rc present=0 unknown=0
+
+    if out="$(timeout -k 2 "$VERIFY_DOCKER_SEC" docker ps -a -q \
+                --filter "name=^/${ADAPTER_HEAD_CONTAINER}\$" 2>/dev/null)"; then
+        if [ -n "$out" ]; then
+            log "verify: $ADAPTER_HEAD_CONTAINER still present on head"
+            present=1
+        fi
+    else
+        rc=$?
+        log "verify: docker query failed on head (rc $rc) — state unknown"
+        unknown=1
+    fi
+
+    if pair; then
+        if out="$(ssh_bounded "$VERIFY_SSH_SEC" \
+                    "docker ps -a -q --filter 'name=^/${ADAPTER_WORKER_CONTAINER}\$'")"; then
+            if [ -n "$out" ]; then
+                log "verify: $ADAPTER_WORKER_CONTAINER still present on worker"
+                present=1
+            fi
+        else
+            log "verify: worker $WORKER_SSH query failed within ${VERIFY_SSH_SEC}s — state unknown"
+            unknown=1
+        fi
+    fi
+
+    [ "$present" -eq 1 ] && return 1
+    [ "$unknown" -eq 1 ] && return 2
+    return 0
+}
+
+# Requires load_launched. Clears the launched record only once the containers are verified gone.
+stop_and_verify() {
+    local rec where; rec="$(launched)"
+    if pair; then
+        where="$ADAPTER_HEAD_CONTAINER / $ADAPTER_WORKER_CONTAINER on $WORKER_SSH"
+    else
+        where="$ADAPTER_HEAD_CONTAINER, head only"
+    fi
+    log "stopping $rec ($where)"
+    adapter_stop || log "adapter_stop for $rec returned non-zero; verifying regardless"
+    if verify_absent; then
+        rm -f "$LAUNCHED"
+        log "$rec is down"
+        return 0
+    fi
+    log "$rec is not verified down; launched record kept"
+    return 1
+}
+
+wait_for_fabric() {
+    local deadline=$(( $(date +%s) + FABRIC_WAIT_SEC ))
+    until derive "$deadline" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            log "fabric facts not derived within ${FABRIC_WAIT_SEC}s; bounded diagnostic attempt follows"
+            derive "$(( $(date +%s) + 10 ))" || true
+            return 1
+        fi
+        sleep 3
+    done
+}
+
+cmd_exec_start() {
+    exec 9>"$LIFECYCLE_LOCK"; flock -w 600 9 || die "lifecycle lock busy"
+
+    local name n rc
+    name="$(selected)" || die "no recipe selected — run: $NAME use <recipe>"
+
+    n=$(( $(cat "$ATTEMPTS" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$n" > "$ATTEMPTS"
+    if [ "$n" -gt "$MAX_START_ATTEMPTS" ]; then
+        log "giving up: $MAX_START_ATTEMPTS consecutive failed starts of $name — run '$NAME use $name' to reset"
+        exit "$EXIT_GIVE_UP"
+    fi
+    log "start attempt $n of $MAX_START_ATTEMPTS for $name"
+
+    # Subshell: the old launch's WORKER_SSH must not leak into the new one.
+    if launched >/dev/null; then
+        log "launched record present — clearing it first"
+        ( load_launched && stop_and_verify ) \
+            || die "cannot verify the previous launch is gone; not launching $name"
+    fi
+
+    load_adapter "$name"
+    require_worker_config "$name" || die "nothing started"
+
+    adapter_prepare || die "$name is not ready to launch (see above); nothing started"
+
+    # Containers with these names but no launched record belong to someone else.
+    verify_absent && rc=0 || rc=$?
+    case "$rc" in
+        1) die "containers for $name exist but were not launched by $NAME — stop them by hand first" ;;
+        2) die "cannot query container state on every node; not launching $name" ;;
+    esac
+
+    log "recipe: $name ($ADAPTER_TOPOLOGY)"
+    if pair; then
+        wait_for_fabric || die "fabric facts unavailable; not launching"
+        report
+    fi
+
+    write_launched "$name"
+    adapter_start
+    rm -f "$ATTEMPTS"
+    log "up — $(adapter_describe | sed -n 's/^api *: //p')"
+}
+
+cmd_exec_stop() {
+    exec 9>"$LIFECYCLE_LOCK"; flock -w 600 9 || die "lifecycle lock busy"
+    load_launched || { log "nothing launched; nothing to stop"; return 0; }
+    stop_and_verify
+}
+
+cmd_cleanup() {
+    exec 9>"$LIFECYCLE_LOCK"; flock -w 600 9 || { log "cleanup: lifecycle lock busy"; return 0; }
+    load_launched || return 0
+    log "cleanup after exit"
+    stop_and_verify || log "cleanup: not verified down — record kept for next start"
+    return 0
+}
+
+cmd_use() {
+    local name="${1:-}" f
+    [ -n "$name" ] || die "usage: $NAME use <model>/<recipe> [--force]"
+    f="$(adapter_file "$name")" || die "invalid recipe name '$name' — form is <model>/<recipe>, see: $NAME list"
+    [ -f "$f" ] || die "no adapter for '$name'; see: $NAME list"
+    refuse_if_activating "${2:-}"
+
+    exec 8>"$SWITCH_LOCK"; flock -w 60 8 || die "another switch is in progress"
+
+    # Check the new recipe before stopping the running one.
+    ( load_adapter "$name" && require_worker_config "$name" && adapter_prepare ) \
+        || die "$name is not ready to launch (see above); the running serve was not touched"
+
+    if launched >/dev/null || systemctl is-active --quiet "$UNIT"; then
+        log "stopping $(launched 2>/dev/null || echo 'the unit') before switching"
+        sudo systemctl stop "$UNIT" || die "stop failed; not switching (see: journalctl -u $UNIT)"
+        if launched >/dev/null; then
+            die "$(launched) is still recorded as launched after stop; not switching"
+        fi
+    fi
+
+    printf '%s\n' "$name" > "$SELECTOR"
+    rm -f "$ATTEMPTS"
+    log "selected: $name"
+
+    # Clears start-limit-hit after a failure loop.
+    if systemctl is-failed --quiet "$UNIT"; then
+        sudo systemctl reset-failed "$UNIT"
+    fi
+    sudo systemctl restart --no-block "$UNIT"
+    log "launch queued — watch it with: journalctl -u $UNIT -f"
+}
+
+# A second start during a launch would kill it; --force allows that.
+refuse_if_activating() {
+    local force="${1:-}"
+    if [ "$(systemctl is-active "$UNIT" 2>/dev/null || true)" = "activating" ] && [ "$force" != "--force" ]; then
+        die "a launch is in progress (unit is activating) — wait for it, or repeat with --force to kill it and start over"
+    fi
+}
+
+cmd_status() {
+    printf 'selected : %s\n' "$(selected 2>/dev/null || echo '(none)')"
+    printf 'attempts : %s\n' "$(cat "$ATTEMPTS" 2>/dev/null || echo 0)"
+    printf 'unit     : %s\n' "$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+    if load_launched; then
+        printf 'launched :\n'
+        sed 's/^/  /' "$LAUNCHED"
+        if adapter_health 2>/dev/null; then printf 'health   : ok\n'; else printf 'health   : DOWN\n'; fi
+    else
+        printf 'launched : (none)\n'
+    fi
+}
+
+# Watchdog: WATCH_FAILS failed /health checks in a row restart the unit, at most once per WATCH_MIN_HEAL seconds.
+# --job-mode=fail keeps a pending stop from being overridden.
+WATCH_FAILS="${WATCH_FAILS:-3}"
+WATCH_MIN_HEAL="${WATCH_MIN_HEAL:-1800}"
+WATCH_FAILS_FILE="$STATE/watch.fails"
+WATCH_HEAL_FILE="$STATE/watch.last_heal"
+
+unit_active() { [ "$(systemctl is-active "$UNIT" 2>/dev/null || true)" = active ]; }
+
+cmd_watch() {
+    local rec fails last now rc
+    # Read-only: as root, creating a lock file would lock the runner account out of it.
+    { exec 8<"$SWITCH_LOCK"; } 2>/dev/null    || { log "watch: $SWITCH_LOCK missing (run install.sh); standing down"; return 0; }
+    flock -n 8 || { log "watch: a switch is in progress; standing down"; return 0; }
+    { exec 9<"$LIFECYCLE_LOCK"; } 2>/dev/null || { log "watch: $LIFECYCLE_LOCK missing (run install.sh); standing down"; return 0; }
+    flock -n 9 || { log "watch: lifecycle lock held; standing down"; return 0; }
+    unit_active || { rm -f "$WATCH_FAILS_FILE"; return 0; }
+    load_launched || { rm -f "$WATCH_FAILS_FILE"; return 0; }
+    rec="$(launched)"
+    if adapter_health 2>/dev/null; then rm -f "$WATCH_FAILS_FILE"; return 0; fi
+    if ! unit_active || [ "$(launched 2>/dev/null || true)" != "$rec" ]; then
+        log "watch: $UNIT changed state during the probe; standing down"; rm -f "$WATCH_FAILS_FILE"; return 0
+    fi
+    fails=$(( $(cat "$WATCH_FAILS_FILE" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$fails" > "$WATCH_FAILS_FILE"
+    log "watch: $rec /health failed, bad tick $fails of $WATCH_FAILS"
+    [ "$fails" -ge "$WATCH_FAILS" ] || return 0
+    now=$(date +%s); last=$(cat "$WATCH_HEAL_FILE" 2>/dev/null || echo 0)
+    if [ $(( now - last )) -lt "$WATCH_MIN_HEAL" ]; then
+        log "watch: unhealthy; a restart was requested $(( now - last )) s ago, the next is allowed after ${WATCH_MIN_HEAL} s"
+        return 1
+    fi
+    systemctl restart --no-block --job-mode=fail "$UNIT" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "watch: unhealthy for $fails ticks; restart request refused (rc $rc); nothing recorded, asked again next tick"
+        return 1
+    fi
+    printf '%s\n' "$now" > "$WATCH_HEAL_FILE"; rm -f "$WATCH_FAILS_FILE"
+    log "watch: unhealthy for $fails ticks; restart of $UNIT requested (job queued)"
+}
+
+cmd_list() {
+    local root="$BASE/adapters" f n=0
+    while IFS= read -r f; do
+        f="${f#"$root"/}"
+        printf '%s\n' "${f%.sh}"
+        n=$(( n + 1 ))
+    done < <(find "$root" -type f -name '*.sh' | sort)
+    [ "$n" -gt 0 ] || echo "(no adapters under $root)"
+}
+
+case "${1:-}" in
+    use)         shift; cmd_use "$@" ;;
+    start)       refuse_if_activating "${2:-}"; sudo systemctl start --no-block "$UNIT"; log "launch queued — watch it with: journalctl -u $UNIT -f" ;;
+    stop)        sudo systemctl stop "$UNIT" ;;
+    restart)     refuse_if_activating "${2:-}"; sudo systemctl restart --no-block "$UNIT"; log "launch queued — watch it with: journalctl -u $UNIT -f" ;;
+    status)      cmd_status ;;
+    list)        cmd_list ;;
+    _exec-start) cmd_exec_start ;;
+    _exec-stop)  cmd_exec_stop ;;
+    _cleanup)    cmd_cleanup ;;
+    _watch)      cmd_watch ;;
+    *)           sed -n '2,13p' "$0"; exit 2 ;;
+esac
