@@ -27,6 +27,8 @@ _run_cmd() {
         set -euo pipefail
         rank=$1 head=$2 worker=$3
         set -a; . "$4"; set +a
+        # GB10: NCCL cuMem allocations exhaust the driver pool at boot (NV_ERR_NO_MEMORY); off unless configured.
+        export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}" NCCL_CUMEM_HOST_ENABLE="${NCCL_CUMEM_HOST_ENABLE:-0}"
         name=$head; [ "$rank" = 1 ] && name=$worker
         args=(docker run -d --restart no --init --name "$name" --gpus all --ipc=host --network host
               --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
