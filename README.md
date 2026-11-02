@@ -252,7 +252,7 @@ serve that dies about 60 s in before suspecting anything else.
 ## Adapters
 
 Each adapter is written from its launcher's source, because the launchers differ in how
-they take configuration. Nineteen adapters, in three groups.
+they take configuration. Twenty adapters, in three groups.
 
 The four vLLM / EXL3 two-Spark recipes:
 
@@ -287,13 +287,13 @@ from its file alone:
 
 Further vLLM and TensorFold recipes:
 
-| | Qwen3.8-Flash-Next Single NVFP4 | DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz) | MiMo-V2.6-Flash | Qwen3.8-Flash TensorFold, two Sparks | DeepSeek-V4.1-Flash-1017 TensorFold TP2 (Bertholomus) |
-|---|---|---|---|---|---|
-| topology | one Spark | two Sparks | two Sparks | two Sparks | two Sparks |
-| config file | `.env` | none | `.env` (`ENV_FILE`) | `.env`, `scripts/local.sh` | `config.env` |
-| environment vs file | caller exports win only for the keys start.sh captures (`PORT`); `.env` wins for the rest, so `TP1_CONTAINER_NAME` is verified and then passed explicitly at start and stop | caller exports win for every key; `MODEL`, `HF_CACHE`, `SNAPSHOT_SHA` and `IMAGE` are exported and the launcher's early-exit controls cleared | file wins; the adapter pins `ENV_FILE` to the recipe's `.env`, computes the effective values and refuses a `.env` that redirects identity, NFS or `ENV_FILE` | environment first, so the node identity is exported (`WORKER`, `FABRIC_PEER`) | file wins (`source config.env`); the adapter pins `DSV41_CONFIG` to it and verifies the node, link, port and host keys, and GID index 5 on both nodes |
-| containers | `vllm-fn-tp1` | `dsv41-flash-exl3` on both nodes | `mimo26-tp2-head` / `-worker` | `qwen38-fn-tf` on both nodes | `tp2-lane` on both nodes (the launcher's name) |
-| image build and downloads | by hand per the recipe's README | by hand (`docker/Dockerfile` as `canonical-e14`, the pinned pack on both nodes) | by hand (`./start.sh build`, the checkpoint) | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand | by hand (`RUNNING.md` sections 1 and 2; the image is pulled on both nodes) |
+| | Qwen3.8-Flash-Next Single NVFP4 | DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz) | MiMo-V2.6-Flash | Qwen3.8-Flash TensorFold, two Sparks | DeepSeek-V4.1-Flash-1017 TensorFold TP2 (Bertholomus) | DeepSeek-V4.1-Flash-1017 BLACKFOLD TP2 |
+|---|---|---|---|---|---|---|
+| topology | one Spark | two Sparks | two Sparks | two Sparks | two Sparks | two Sparks |
+| config file | `.env` | none | `.env` (`ENV_FILE`) | `.env`, `scripts/local.sh` | `config.env` | `deploy/blackfold.env` |
+| environment vs file | caller exports win only for the keys start.sh captures (`PORT`); `.env` wins for the rest, so `TP1_CONTAINER_NAME` is verified and then passed explicitly at start and stop | caller exports win for every key; `MODEL`, `HF_CACHE`, `SNAPSHOT_SHA` and `IMAGE` are exported and the launcher's early-exit controls cleared | file wins; the adapter pins `ENV_FILE` to the recipe's `.env`, computes the effective values and refuses a `.env` that redirects identity, NFS or `ENV_FILE` | environment first, so the node identity is exported (`WORKER`, `FABRIC_PEER`) | file wins (`source config.env`); the adapter pins `DSV41_CONFIG` to it and verifies the node, link, port and host keys, and GID index 5 on both nodes | file wins (`. blackfold.env`); the adapter verifies the node, link and port keys and that the launcher's own GID pick on each node is the derived index |
+| containers | `vllm-fn-tp1` | `dsv41-flash-exl3` on both nodes | `mimo26-tp2-head` / `-worker` | `qwen38-fn-tf` on both nodes | `tp2-lane` on both nodes (the launcher's name) | `ds41-native` on both nodes (the launcher's name) |
+| image build and downloads | by hand per the recipe's README | by hand (`docker/Dockerfile` as `canonical-e14`, the pinned pack on both nodes) | by hand (`./start.sh build`, the checkpoint) | never from the unit (`PREPARE=0`); run `scripts/prepare.sh` by hand | by hand (`RUNNING.md` sections 1 and 2; the image is pulled on both nodes) | by hand (the recipe's README steps 1 to 4) |
 
 The eugr/spark-vllm-docker recipes (vLLM b12x, NVIDIA FP4-Local checkpoints): one checkout shared by four adapters,
 `recipes/<model>/<recipe>` symlinks to it, each adapter naming its recipe explicitly. An adapter whose checkpoint is
@@ -339,6 +339,7 @@ adapter say what to look for.
 | Qwen3.8-Flash TensorFold, two Sparks | MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold | not launched | 6730319 |
 | DeepSeek-V4.1-Flash EXL3 vLLM (sfxnz) | sfxnz/DeepSeek-V4.1-Flash-EXL3-vLLM-2x-DGX-Spark | not launched | 3de9146 |
 | DeepSeek-V4.1-Flash-1017 TensorFold TP2 (Bertholomus) | bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 | not launched | 503b64e |
+| DeepSeek-V4.1-Flash-1017 BLACKFOLD TP2 | Blackwellboy/DeepSeek-V4.1-Flash-1017-BLACKFOLD-TP2 | not launched | d905cf0 |
 | MiMo-V2.6-Flash | MiaAI-Lab/MiMo-V2.6-Flash-2x-DGX-Sparks | not launched | 201be3e |
 | Qwen3.8-Flash-Next FP4-Local, one Spark | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
 | Qwen3.8-Flash-Next FP4-Local, two Sparks | eugr/spark-vllm-docker | not launched | 0bdc9c9 |
@@ -403,6 +404,11 @@ One-time, in the recipe's own config file, beyond what its README already asks f
 - **DeepSeek-V4.1-Flash-1017 TensorFold TP2 (Bertholomus)**: `cp config.env.example config.env`, then `NODES` (this host,
   then the worker), `MASTER_IP`, `RDMA_HCA`, `NET_IF`, the paths, `PORT=8888` and `HOST=0.0.0.0`; `RUNNING.md` sections 1
   and 2 on both nodes. The engine opens GID index 5; the adapter refuses another index.
+- **DeepSeek-V4.1-Flash-1017 BLACKFOLD TP2**: `cp deploy/blackfold.env.example deploy/blackfold.env`, then `HEAD_ADDR`,
+  `WORKER_SSH`, `PRIMARY_HCA`, `PRIMARY_NETDEV`, the image, build, kit, template and data paths, and `PORT=8888`; the
+  recipe's README steps 1 to 4 on both nodes. Its launcher reads each node's GID index from sysfs and runs
+  `sudo -n tee /proc/sys/vm/drop_caches` and, for the second rail, `sudo -n /usr/local/bin/blackfold-rail-align`; a
+  sudoers rule for the first is required, the second falls back to one rail.
 - **eugr/spark-vllm-docker recipes**: clone it once to `recipes/spark-vllm-docker` at the reviewed commit and link
   `recipes/Qwen3.8-Flash-Next/qwen3.8-flash-next-nvfp4-solo`, `.../qwen3.8-flash-next-nvfp4-cluster` and
   `recipes/GLM-5.3-Flash/glm-5.3-flash` and `recipes/GLM-5.3-Flash/glm-5.3-flash-huihui-abliterated` to it; PyYAML on the head; `./build-and-copy.sh --exp-b12x` on the head (and
