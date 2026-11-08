@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Adapter: DeepSeek-V4.1-Flash on TensorFold's CUDA Zig engine, 2x DGX Spark (jayleaton/deepseek-v41-tensorfold-spark, docs/ZIG-SERVE.md).
 # Starts both ranks from the head with the same `docker run` as scripts/run-zig.sh, detached, except --max-tokens is the full context.
-# Settings are forwarded as run-zig.sh forwards them: the names scripts/engine_settings.py prints, legacy names refused.
 # The worker needs the image, model, Engram shards, assets and cache at the head's paths.
 # The example config enables lossy expert pruning (TF_DSV41_EXPERT_TOPP=0.85); remove that line for the unpruned model.
 
@@ -22,7 +21,6 @@ _in_list() {
     return 1
 }
 
-# The recipe's NATIVE_AUTH_FILE rules (scripts/run-zig.sh).
 _AUTH_FILE_CHECK='
 import os, stat, sys
 path, shared = sys.argv[1], [os.path.realpath(d) for d in sys.argv[2:] if d]
@@ -39,7 +37,6 @@ except (OSError, ValueError):
     raise SystemExit("adapter: NATIVE_AUTH_FILE must be a nonempty regular file with mode 0600, owned by you or root, at an absolute symlink-free path outside the checkout and the model, engram, assets, prepared, state and cache directories")
 '
 
-# Prints the shell-quoted `docker run` for rank $1.
 _run_cmd() {
     env -i PATH="$PATH" bash -c '
         set -euo pipefail
@@ -106,7 +103,6 @@ _identity_ok() {
     [ "$bad" = 0 ]
 }
 
-# Fails on missing files or a truncated shard; prints the file list with sizes for comparing the two nodes.
 _MODEL_CHECK='
 import json, os, struct, sys
 d = sys.argv[1]
@@ -261,8 +257,6 @@ _running() {
     fi
 }
 
-# Starts rank 1, then rank 0; ready once /v1/models answers and the recipe's 17 * 23 check returns 391
-# (with NATIVE_AUTH_FILE: once /health answers). A durable STOP file refuses the start, as in run-zig.sh.
 adapter_start() {
     _identity_ok || return 1
     local state deadline reply stop auth cmd0 cmd1

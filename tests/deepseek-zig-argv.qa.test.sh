@@ -4,7 +4,7 @@ ADAPTER=${ADAPTER:-adapters/DeepSeek-V4.1-Flash/deepseek-v41-tensorfold-spark-zi
 RECIPE=${ZIG_RECIPE_DIR:?Set ZIG_RECIPE_DIR to the recipe checkout}
 
 pass=0; fail=0
-check() { # check <description> <condition-result>
+check() {
   if [ "$2" = 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi
 }
 has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }

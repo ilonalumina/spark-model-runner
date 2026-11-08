@@ -10,7 +10,7 @@ has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/state"
 
-write_config() { # write_config <effort> <authfile>
+write_config() {
 cat > "$work/prod-zig.env" <<EOF
 IMAGE=qa/image:test
 MODEL_DIR=/models/qa
