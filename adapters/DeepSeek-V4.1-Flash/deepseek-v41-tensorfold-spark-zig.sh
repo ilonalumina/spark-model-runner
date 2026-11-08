@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Adapter: DeepSeek-V4.1-Flash on TensorFold's CUDA Zig engine, 2x DGX Spark (jayleaton/deepseek-v41-tensorfold-spark, docs/ZIG-SERVE.md).
 # Starts both ranks from the head with the same `docker run` as scripts/run-zig.sh, detached, except --max-tokens is the full context.
+# Settings are forwarded as run-zig.sh forwards them: the names scripts/engine_settings.py prints, legacy names refused.
 # The worker needs the image, model, Engram shards, assets and cache at the head's paths.
 # The example config enables lossy expert pruning (TF_DSV41_EXPERT_TOPP=0.85); remove that line for the unpruned model.
 
@@ -21,36 +22,75 @@ _in_list() {
     return 1
 }
 
+# The recipe's NATIVE_AUTH_FILE rules (scripts/run-zig.sh).
+_AUTH_FILE_CHECK='
+import os, stat, sys
+path, shared = sys.argv[1], [os.path.realpath(d) for d in sys.argv[2:] if d]
+try:
+    if not os.path.isabs(path) or any(c in path for c in ":\r\n") or os.path.realpath(path) != os.path.normpath(path):
+        raise ValueError
+    info = os.lstat(path)
+    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid not in (os.geteuid(), 0) or not 0 < info.st_size <= 1048576):
+        raise ValueError
+    if any(os.path.commonpath([path, d]) == d for d in shared):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit("adapter: NATIVE_AUTH_FILE must be a nonempty regular file with mode 0600, owned by you or root, at an absolute symlink-free path outside the checkout and the model, engram, assets, prepared, state and cache directories")
+'
+
 # Prints the shell-quoted `docker run` for rank $1.
 _run_cmd() {
     env -i PATH="$PATH" bash -c '
         set -euo pipefail
         rank=$1 head=$2 worker=$3
+        cd "$5"
         set -a; . "$4"; set +a
+        case "${TF_DSV41_DEFAULT_EFFORT:-}" in ""|low|medium|high|xhigh) ;;
+            *) echo "adapter: TF_DSV41_DEFAULT_EFFORT must be low, medium, high or xhigh" >&2; exit 2 ;; esac
+        if [ "$rank" = 0 ] && [ -n "${TENSORFOLD_API_KEY:-}" ] && [ -z "${NATIVE_AUTH_FILE:-}" ]; then
+            echo "adapter: native authentication requires NATIVE_AUTH_FILE; move TENSORFOLD_API_KEY out of the config into a mode-0600 file" >&2; exit 2
+        fi
+        export TF_EXPERIMENTAL=deepseek
         # GB10: NCCL cuMem allocations exhaust the driver pool at boot (NV_ERR_NO_MEMORY); off unless configured.
         export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}" NCCL_CUMEM_HOST_ENABLE="${NCCL_CUMEM_HOST_ENABLE:-0}"
+        names="$(compgen -v | python3 scripts/engine_settings.py forward)"
+        rev="$(cat config/tensorfold.rev)"
         name=$head; [ "$rank" = 1 ] && name=$worker
         args=(docker run -d --restart no --init --name "$name" --gpus all --ipc=host --network host
               --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
+              --label "org.tensorfold.revision=$rev" --label "org.tensorfold.rank=$rank"
               -v "$MODEL_DIR:/model:ro" -v "$ENGRAM_DIR:/engram:ro" -v "$ASSETS_DIR:/assets:ro"
               -v "$PREPARED_DIR:/prepared" -v "$STATE_DIR:/state" -v "$STATE_DIR/sessions:/sessions"
               -v "$CACHE_DIR:/cache")
-        while IFS="=" read -r key value; do
-            case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) args+=(-e "$key=${!key}");; esac
-        done < <(env | LC_ALL=C sort)
+        while IFS= read -r key; do
+            [ -n "$key" ] && args+=(-e "$key=${!key}")
+        done <<<"$names"
         args+=(-e TF_TP_WORLD=2 -e "TF_TP_RANK=$rank" -e TF_TP_DEVICE=0
                -e "TF_TP_MASTER=$TF_TP_MASTER" -e "TF_TP_PORT=${TF_TP_PORT:-29571}"
                -e "TF_COMM_BACKEND=${TF_COMM_BACKEND:-roce}"
-               -e TF_TP_KERNEL_IMAGE=/opt/tensorfold/share/tp_mailbox.fatbin "$IMAGE")
+               -e TF_DSV41_ASSETS=/assets -e TF_DSV41_ENGRAM_DIR=/engram
+               -e TF_TP_KERNEL_IMAGE=/opt/tensorfold/share/tp_mailbox.fatbin)
+        [ -z "${CPUSET_CPUS:-}" ] || args+=(--cpuset-cpus "$CPUSET_CPUS")
+        auth=""
+        if [ "$rank" = 0 ] && [ -n "${NATIVE_AUTH_FILE:-}" ]; then
+            python3 -c "$6" "$NATIVE_AUTH_FILE" "$PWD" "$MODEL_DIR" "$ENGRAM_DIR" "$ASSETS_DIR" "$PREPARED_DIR" "$STATE_DIR" "$CACHE_DIR"
+            args+=(-v "$NATIVE_AUTH_FILE:/run/tensorfold/auth-keys:ro")
+            auth=1
+        fi
+        args+=("$IMAGE")
         if [ "$rank" = 0 ]; then
             args+=(tensorfold-dsv41 serve /model --host "${HOST:-localhost}" --port "${PORT:-8000}"
-                   --parallel "$TF_DSV41_SLOTS" --context "$TF_DSV41_CONTEXT"
-                   --name DeepSeek-V4.1-Flash-TF --max-tokens "$TF_DSV41_CONTEXT")
+                   --parallel "${TF_DSV41_SLOTS:-1}" --context "${TF_DSV41_CONTEXT:-4096}"
+                   --name DeepSeek-V4.1-Flash-TF --max-tokens "${TF_DSV41_CONTEXT:-4096}")
+            [ "${TF_DSV41_THINKING:-1}" != 0 ] || args+=(--no-thinking)
+            [ -z "${TF_DSV41_DEFAULT_EFFORT:-}" ] || args+=(--reasoning-effort "$TF_DSV41_DEFAULT_EFFORT")
+            [ -z "$auth" ] || args+=(--api-key-file /run/tensorfold/auth-keys)
         else
-            args+=(tf-dsv41-m1 follow /model /assets)
+            args+=(tf-dsv41 follow /model /assets)
         fi
         printf "%q " "${args[@]}"
-    ' _ "$1" "$ADAPTER_HEAD_CONTAINER" "$ADAPTER_WORKER_CONTAINER" "$(_config)"
+    ' _ "$1" "$ADAPTER_HEAD_CONTAINER" "$ADAPTER_WORKER_CONTAINER" "$(_config)" "$RECIPE_DIR" "$_AUTH_FILE_CHECK"
 }
 
 _identity_ok() {
@@ -183,17 +223,19 @@ _files_ready() {
 }
 
 _image_ready() {
-    local image want h w label
-    image="$(_cfg IMAGE)"; want="$(git -C "$RECIPE_DIR" rev-parse HEAD)"
-    h="$(docker image inspect "$image" --format '{{.Id}} {{index .Config.Labels "org.tensorfold.zig-commit"}}' 2>/dev/null)" \
-        || { echo "adapter: image $image is not on the head (docs/ZIG-SERVE.md step 2)" >&2; return 1; }
-    w="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" \
-        "docker image inspect '$image' --format '{{.Id}} {{index .Config.Labels \"org.tensorfold.zig-commit\"}}'" 2>/dev/null)" \
-        || { echo "adapter: image $image is not on the worker (docs/ZIG-SERVE.md step 2: docker load it there)" >&2; return 1; }
-    [ "$h" = "$w" ] || { echo "adapter: image $image differs: head $h, worker $w (docs/ZIG-SERVE.md step 2)" >&2; return 1; }
-    label="${h#* }"
-    [ "$label" = "$want" ] && [ "$(_cfg ZIG_COMMIT)" = "$want" ] \
-        || { echo "adapter: image built from ${label:-?}, config ZIG_COMMIT $(_cfg ZIG_COMMIT), checkout $want (rebuild, and set ZIG_COMMIT, after updating the checkout)" >&2; return 1; }
+    local image want fmt h w hr wr
+    image="$(_cfg IMAGE)"; want="$(cat "$RECIPE_DIR/config/tensorfold.rev")"
+    fmt='{"config":{{json .Config}},"layers":{{json .RootFS.Layers}},"os":{{json .Os}},"architecture":{{json .Architecture}},"variant":{{json .Variant}}}'
+    hr="$(docker image inspect -f '{{index .Config.Labels "org.tensorfold.revision"}}' "$image" 2>/dev/null)" \
+        || { echo "adapter: image $image is not on the head (docs/ZIG-SERVE.md, Build)" >&2; return 1; }
+    wr="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" \
+        "docker image inspect -f '{{index .Config.Labels \"org.tensorfold.revision\"}}' '$image'" 2>/dev/null)" \
+        || { echo "adapter: image $image is not on the worker (docs/ZIG-SERVE.md, Build: docker load it there)" >&2; return 1; }
+    [ "$hr" = "$want" ] && [ "$wr" = "$want" ] \
+        || { echo "adapter: image engine revision head ${hr:-?}, worker ${wr:-?}; config/tensorfold.rev is $want (rebuild after updating the checkout)" >&2; return 1; }
+    h="$(docker image inspect -f "$fmt" "$image" | sha256sum)"
+    w="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "docker image inspect -f $(printf '%q' "$fmt") '$image'" | sha256sum)"
+    [ "$h" = "$w" ] || { echo "adapter: image $image differs between the head and the worker (docs/ZIG-SERVE.md, Build: docker save on the head, docker load on the worker)" >&2; return 1; }
 }
 
 adapter_prepare() {
@@ -219,22 +261,32 @@ _running() {
     fi
 }
 
-# Starts rank 1, then rank 0; ready once /v1/models answers and the recipe's 17 * 23 check returns 391.
+# Starts rank 1, then rank 0; ready once /v1/models answers and the recipe's 17 * 23 check returns 391
+# (with NATIVE_AUTH_FILE: once /health answers). A durable STOP file refuses the start, as in run-zig.sh.
 adapter_start() {
     _identity_ok || return 1
-    local state deadline reply
+    local state deadline reply stop auth cmd0 cmd1
     state="$(_cfg STATE_DIR)"
+    stop="$(_cfg STOP_FILE)"; stop="${stop:-$state/native-ops/STOP}"
+    [ ! -e "$stop" ] || { echo "adapter: durable STOP is set ($stop); remove it to start" >&2; return 1; }
+    auth="$(_cfg NATIVE_AUTH_FILE)"
+    cmd1="$(_run_cmd 1)" || { echo "adapter: the rank 1 command could not be built from $(_config)" >&2; return 1; }
+    cmd0="$(_run_cmd 0)" || { echo "adapter: the rank 0 command could not be built from $(_config)" >&2; return 1; }
     mkdir -p "$(_cfg PREPARED_DIR)" "$state/sessions" || return 1
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "mkdir -p '$(_cfg PREPARED_DIR)' '$state/sessions' && $(_run_cmd 1)" >/dev/null \
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "mkdir -p '$(_cfg PREPARED_DIR)' '$state/sessions' && $cmd1" >/dev/null \
         || { echo "adapter: rank 1 did not start on the worker" >&2; return 1; }
-    eval "$(_run_cmd 0)" >/dev/null || { echo "adapter: rank 0 did not start" >&2; return 1; }
+    eval "$cmd0" >/dev/null || { echo "adapter: rank 0 did not start" >&2; return 1; }
     deadline=$(( $(date +%s) + ADAPTER_READY_TIMEOUT ))
-    until curl -fsS -m 5 -o /dev/null "http://127.0.0.1:${ADAPTER_PORT}/v1/models"; do
+    local probe=/v1/models
+    [ -z "$auth" ] || probe=/health
+    until curl -fsS -m 5 -o /dev/null "http://127.0.0.1:${ADAPTER_PORT}${probe}"; do
         _running "$ADAPTER_HEAD_CONTAINER" || { echo "adapter: rank 0 exited during the load (docker logs $ADAPTER_HEAD_CONTAINER)" >&2; return 1; }
         _running "$ADAPTER_WORKER_CONTAINER" w || { echo "adapter: rank 1 exited during the load (docker logs $ADAPTER_WORKER_CONTAINER on the worker)" >&2; return 1; }
         [ "$(date +%s)" -lt "$deadline" ] || { echo "adapter: not serving after ${ADAPTER_READY_TIMEOUT}s" >&2; return 1; }
         sleep 5
     done
+    # Serving keys are not diagnostic credentials: with native auth, /health is the readiness check.
+    [ -z "$auth" ] || return 0
     reply="$(curl -fsS -m 300 "http://127.0.0.1:${ADAPTER_PORT}/v1/chat/completions" -H 'Content-Type: application/json' \
         -d "{\"model\":\"$ADAPTER_MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23?\"}],\"temperature\":0,\"reasoning_effort\":\"low\"}")" \
         || { echo "adapter: the check request failed" >&2; return 1; }
@@ -247,7 +299,7 @@ adapter_stop() {
     local logs t drain
     logs="${ADAPTER_LOG_DIR:-$(_cfg STATE_DIR)/logs}"
     t="$(date -u +%Y%m%dT%H%M%SZ)"
-    drain="$(_cfg TF_DSV41_DRAIN_S 2>/dev/null)"; drain="${drain:-20}"
+    drain="$(_cfg TF_DRAIN_S 2>/dev/null)"; drain="${drain:-20}"
     local save='mkdir -p "$1" && docker logs "$2" > "$1/$2-$3.log" 2>&1; ls -1t "$1/$2"-*.log 2>/dev/null | tail -n +11 | xargs -r rm -f'
     docker stop -t "$(( drain + 60 ))" "$ADAPTER_HEAD_CONTAINER" >/dev/null 2>&1 || true
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" \

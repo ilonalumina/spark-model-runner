@@ -332,7 +332,7 @@ adapter say what to look for.
 | GLM-5.3-Flash TensorFold (MiaAI-Lab) | MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold | 92bf731 | 3fd60df |
 | GLM-5.3-Flash TensorFold (jayleaton) | jayleaton/glm53-tensorfold-spark | b463237 | f79bf9c |
 | DeepSeek-V4.1-Flash TensorFold | jayleaton/deepseek-v41-tensorfold-spark | not recorded | 2dcce03 |
-| DeepSeek-V4.1-Flash TensorFold Zig | jayleaton/deepseek-v41-tensorfold-spark | c34da993 | 2dcce03 |
+| DeepSeek-V4.1-Flash TensorFold Zig | jayleaton/deepseek-v41-tensorfold-spark | c34da993 | ed96ef6 |
 | DeepSeek-V4.1-Flash-1017 TensorFold Zig | MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks | 27741e1 | 27741e1 |
 | Qwen3.8-Flash-Next TensorFold, one Spark | MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold | not launched | 656879f |
 | Qwen3.8-Flash-Next Single NVFP4 | MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark | not launched | b7c5da1 |
@@ -382,11 +382,14 @@ One-time, in the recipe's own config file, beyond what its README already asks f
   differs from the derived facts. The DeepSeek recipe's own watchdog and boot units
   (`scripts/systemd`) stay unused: the runner owns start, stop and boot, and its own
   watchdog timer does the recipe watchdog's job for every recipe.
-- **DeepSeek-V4.1-Flash TensorFold Zig**: `cp config/prod-zig.env.example
-  config/prod-zig.env` and fill it in, build the image with `ZIG_COMMIT` set to the
+- **DeepSeek-V4.1-Flash TensorFold Zig**: copy the recipe's recommended profile
+  `config/prod-zig-flash17.env.example` (or the rollback `config/prod-zig.env.example`) to
+  `config/prod-zig.env` and fill it in, build the image with `ZIG_COMMIT` set to the
   checkout's commit, and put the image, the model, the Engram shards, the assets and the
   cache directory on both nodes at the same paths (`docs/ZIG-SERVE.md`). The adapter
-  starts both ranks from the head, so the worker needs no checkout.
+  starts both ranks from the head, so the worker needs no checkout. It refuses to start while
+  the recipe's durable STOP file exists. With `NATIVE_AUTH_FILE` set, readiness is `/health`
+  alone, as in the recipe's own supervisor.
   The example config enables lossy decode-time expert pruning with
   `TF_DSV41_EXPERT_TOPP=0.85`, which can change model responses. To disable pruning,
   remove that setting from `config/prod-zig.env` and run `model-runner restart`.
